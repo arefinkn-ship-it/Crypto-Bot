@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 # ============================================================
 #  CRYPTO BOT V2 - MAIN ENTRY POINT
+#  CHANGES FROM PREVIOUS VERSION:
+#   - BTC H1 trend fetched once per scan cycle, used to gate
+#     altcoin signals fighting the dominant BTC trend (live data
+#     showed SELL signals at 10% win rate, clustering exactly at
+#     BTC-led dips within a broader uptrend).
+#   - Correlation dedup applied to strong_signals before alerting -
+#     simultaneous correlated signals (one market move counted many
+#     times) now collapse to the single highest-scored alert.
 # ============================================================
 
 import sys
 import time
 from pathlib import Path
 from typing import Dict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta  # ADDED BACK
 
 import pandas as pd
 
@@ -27,6 +35,8 @@ from src.signals.alert import AlertManager
 from src.signals.multi_timeframe import get_multi_timeframe_signal
 from src.signals.signal_logger import SignalLogger
 from src.signals.trade_tracker import TradeTracker
+from src.signals.btc_trend_filter import get_btc_trend, passes_btc_trend_gate
+from src.signals.correlation_filter import dedupe_correlated_signals
 
 from src.strategies.trend_following import trend_following
 from src.strategies.breakout import breakout
@@ -69,7 +79,7 @@ def evaluate_strategies(data: pd.DataFrame) -> Dict:
     return combined
 
 
-def log_diagnostics(symbol: str, m5_signal: Dict, mt_signal: Dict):
+def log_diagnostics(symbol: str, m5_signal: Dict, mt_signal: Dict, btc_block_reason: str = None):
     logger.debug(
         f"[diag] {symbol}: 5m_dir={m5_signal['direction']} "
         f"5m_score={m5_signal['total_score']} "
@@ -80,6 +90,7 @@ def log_diagnostics(symbol: str, m5_signal: Dict, mt_signal: Dict):
         f"boosted={mt_signal['score_boosted']} "
         f"align_mult={mt_signal['alignment_multiplier']} "
         f"reason='{mt_signal['reason']}'"
+        + (f" | btc_gate='{btc_block_reason}'" if btc_block_reason else "")
     )
 
 
@@ -101,6 +112,7 @@ def main():
                     f"MIN_SIGNAL_SCORE={MIN_SIGNAL_SCORE}")
         logger.info(f"📊 Coin universe: {len(COIN_WHITELIST)} whitelisted symbols")
         logger.info("📊 3 core strategies active: trend_following, breakout, mean_reversion")
+        logger.info("📊 BTC trend gate + correlation dedup active")
 
         logger.info("✅ Bot initialized successfully!")
         logger.info("📊 Ready to scan for signals...")
@@ -115,6 +127,12 @@ def main():
                 logger.info(f"📈 Scanning {len(coins)} coins")
 
                 collector.collect_all(coins)
+
+                # Fetch BTC's H1 trend ONCE per cycle - reused as the
+                # gate for every altcoin below, not recomputed per symbol.
+                btc_trend = get_btc_trend(loader)
+                logger.info(f"📊 BTC H1 trend: {btc_trend.get('direction')} "
+                            f"(strength={btc_trend.get('strength', 0)})")
 
                 strong_signals = []
                 all_scores = []
@@ -135,7 +153,18 @@ def main():
                             m5_data=m5_data, m5_signals=m5_signal,
                         )
 
-                        log_diagnostics(symbol, m5_signal, mt_signal)
+                        # BTC trend gate - blocks alts fighting BTC's own trend
+                        btc_block_reason = None
+                        if mt_signal['direction'] != 'NEUTRAL':
+                            btc_block_reason = passes_btc_trend_gate(
+                                symbol, mt_signal['direction'], btc_trend
+                            )
+                            if btc_block_reason:
+                                mt_signal['score_boosted'] = 0
+                                mt_signal['direction'] = 'NEUTRAL'
+                                mt_signal['reason'] = btc_block_reason
+
+                        log_diagnostics(symbol, m5_signal, mt_signal, btc_block_reason)
                         all_scores.append({
                             'symbol': symbol,
                             'score_boosted': mt_signal['score_boosted'],
@@ -161,7 +190,7 @@ def main():
                                 entry_price=latest_price, atr_value=atr_value,
                                 direction=mt_signal['direction'],
                             )
-                            signal_data = {
+                            strong_signals.append({
                                 'symbol': symbol,
                                 'signal': mt_signal['direction'],
                                 'confidence': mt_signal['confidence'],
@@ -175,8 +204,7 @@ def main():
                                 'take_profit': risk['take_profit'],
                                 'risk_reward': risk['risk_reward_ratio'],
                                 'strategies': m5_signal.get('strategies', {}),
-                            }
-                            strong_signals.append(signal_data)
+                            })
 
                     except Exception as e:
                         logger.error(f"Error evaluating {symbol}: {e}")
@@ -187,26 +215,44 @@ def main():
                     for s in top5:
                         logger.info(f"   {s['symbol']}: {s['direction']} {s['score_boosted']}/10")
 
+                # ---- Correlation dedup: collapse simultaneous correlated
+                # signals down to the single highest-scored one per cluster ----
                 if strong_signals:
                     strong_signals.sort(key=lambda x: x['score'], reverse=True)
+
+                    price_data = {}
+                    for s in strong_signals:
+                        try:
+                            price_data[s['symbol']] = loader.load_ohlcv(
+                                s['symbol'], '5m', limit=50
+                            )['close']
+                        except Exception:
+                            pass
+
+                    before_count = len(strong_signals)
+                    strong_signals = dedupe_correlated_signals(strong_signals, price_data)
+                    deduped_count = before_count - len(strong_signals)
+                    if deduped_count > 0:
+                        logger.info(f"📊 Correlation dedup: dropped {deduped_count} "
+                                    f"correlated duplicate signal(s)")
+
+                if strong_signals:
                     logger.info(f"📊 Found {len(strong_signals)} signals clearing threshold "
-                                f"({MIN_SIGNAL_SCORE})")
+                                f"({MIN_SIGNAL_SCORE}) after dedup")
                     for signal in strong_signals[:5]:
                         logger.info(f"   {signal['symbol']}: {signal['signal']} "
                                     f"({signal['score']:.1f}/10) - {signal['confidence']}")
                         logger.info(f"      Reason: {signal['reason']}")
-                        
-                        alerts.send_alert(signal)
-                        tracker.open_trade(
-                            symbol=signal['symbol'],
-                            direction=signal['signal'],
-                            confidence=signal['confidence'],
-                            score=signal['score'],
-                            entry_price=signal['latest_price'],
-                            stop_loss=signal['stop_loss'],
-                            take_profit=signal['take_profit'],
-                            entry_time=signal['timestamp'],
-                        )
+                        sent = alerts.send_alert(signal)
+                        if sent:
+                            tracker.open_trade(
+                                symbol=signal['symbol'], direction=signal['signal'],
+                                confidence=signal['confidence'], score=signal['score'],
+                                entry_price=signal['latest_price'],
+                                stop_loss=signal['stop_loss'],
+                                take_profit=signal['take_profit'],
+                                entry_time=signal['timestamp'],
+                            )
                 else:
                     logger.info(f"🔍 No signals cleared threshold ({MIN_SIGNAL_SCORE}) this scan")
 
@@ -221,7 +267,7 @@ def main():
                 import traceback
                 traceback.print_exc()
 
-            # Calculate and display next scan time
+            # Calculate and display next scan time (ADDED BACK)
             next_scan_time = datetime.now() + timedelta(seconds=SCAN_INTERVAL_SECONDS)
             next_scan_str = next_scan_time.strftime("%Y-%m-%d %H:%M:%S")
             logger.info(f"⏳ Waiting {SCAN_INTERVAL_SECONDS}s for next scan... (next scan at {next_scan_str})")
