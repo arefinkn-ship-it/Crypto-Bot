@@ -6,7 +6,7 @@
 python-dotenv==1.0.0
 
 # Database - SQLite only
-sqlalchemy==2.0.23
+sqlalchemy==2.0.40
 
 # Binance API
 ccxt==4.1.78
