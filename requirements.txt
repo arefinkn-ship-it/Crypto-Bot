@@ -1,5 +1,5 @@
 # ============================================================
-#  CORE DEPENDENCIES - Python 3.14 Compatible
+#  CORE DEPENDENCIES
 # ============================================================
 
 # Security & Config
@@ -12,14 +12,13 @@ sqlalchemy==2.0.23
 ccxt==4.1.78
 python-binance==1.0.19
 
-# Data Processing - Using latest compatible versions
-pandas>=2.3.0
-numpy>=2.0.0
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
 ta==0.10.2
 
 # Async & HTTP
 aiohttp==3.9.1
-asyncio==3.4.3
 aiofiles==23.2.1
 
 # Logging
@@ -30,6 +29,5 @@ rich==13.7.0
 python-telegram-bot==20.6
 
 # Utils
-pydantic==2.5.0
 python-dateutil==2.8.2
 pytz==2023.3
